@@ -1,9 +1,11 @@
+require('dotenv').config();
+
 const fs = require('fs');
 const cron = require('node-cron');
 
 // --- CONFIGURATION ---
 // REPLACE THIS WITH YOUR CLOUDFLARE WORKER URL
-const SETTINGS_URL = 'https://dashboard.linzihan663.workers.dev/api/settings';
+const SETTINGS_URL = 'https://your-worker-name.your-subdomain.workers.dev/api/settings';
 
 const MARKETPLACE_URL = 'https://weav3r.dev/api/marketplace';
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -47,10 +49,9 @@ async function fetchSettings() {
   }
 }
 
-async function sendDiscordAlert(name, itemId, oldPrice, newPrice, dropPct) {
+async function sendDiscordAlert(name, itemId, oldPrice, newPrice, dropPct, link) {
   if (!currentSettings.webhook) return;
 
-  const link = `https://www.torn.com/bazaar.php?itemId=${itemId}`;
   const payload = {
     embeds: [{
       title: `📉 Price Drop: ${name}`,
@@ -151,7 +152,29 @@ async function checkPrices() {
         if (dropPct >= currentSettings.threshold) {
           dropsFound++;
           console.log(`[DROP] 📉 ${item.item_name}: ${(dropPct).toFixed(2)}% ($${prevPrice} → $${item.lowest_price})`);
-          await sendDiscordAlert(item.item_name, id, prevPrice, item.lowest_price, dropPct);
+          
+          // Get detailed info for the link (Find cheapest player)
+          let link = `https://www.torn.com/bazaar.php?itemId=${id}`;
+          try {
+            const detailRes = await fetch(`${MARKETPLACE_URL}/${id}`, {
+              headers: { 'User-Agent': USER_AGENT }
+            });
+            if (detailRes.ok) {
+              const detailData = await detailRes.json();
+              if (detailData.listings && detailData.listings.length > 0) {
+                // Sort by price to find the absolute cheapest
+                const sortedListings = detailData.listings.sort((a, b) => a.price - b.price);
+                const cheapestPlayerId = sortedListings[0].player_id;
+                if (cheapestPlayerId) {
+                  link = `https://www.torn.com/bazaar.php?userId=${cheapestPlayerId}#/`;
+                }
+              }
+            }
+          } catch (err) {
+            console.error(`[WARN] Could not fetch details for link: ${err.message}`);
+          }
+
+          await sendDiscordAlert(item.item_name, id, prevPrice, item.lowest_price, dropPct, link);
         }
       }
     }
