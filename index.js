@@ -1,167 +1,187 @@
-require('dotenv').config();
+const fs = require('fs');
+const cron = require('node-cron');
+
+// --- CONFIGURATION ---
+// REPLACE THIS WITH YOUR CLOUDFLARE WORKER URL
+const SETTINGS_URL = 'https://dashboard.linzihan663.workers.dev/api/settings';
 
 const MARKETPLACE_URL = 'https://weav3r.dev/api/marketplace';
-const PRICE_DROP_THRESHOLD = 0.01; // 1% drop triggers alert
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const CACHE_FILE = './price_cache.json';
 
-// Optional: Only track specific IDs. Leave empty [] to track EVERYTHING
-const TRACKED_ITEM_IDS = []; 
-
 let cachedMarketData = {};
-const fs = require('fs');
-const cron = require('node-cron');
+let currentSettings = {};
+
+// --- HELPER FUNCTIONS ---
 
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
       const data = fs.readFileSync(CACHE_FILE, 'utf8');
       cachedMarketData = JSON.parse(data);
-      console.log(`[CACHE] Loaded ${Object.keys(cachedMarketData).length} items from file`);
+      console.log(`[CACHE] Loaded ${Object.keys(cachedMarketData).length} items`);
     }
-  } catch (err) {
-    console.error('[CACHE] Failed to load:', err.message);
-  }
+  } catch (err) { console.error('[CACHE] Load failed:', err.message); }
 }
 
 function saveCache() {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedMarketData, null, 0)); // Compact JSON for speed
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedMarketData, null, 0));
+  } catch (err) { console.error('[CACHE] Save failed:', err.message); }
+}
+
+async function fetchSettings() {
+  try {
+    const res = await fetch(SETTINGS_URL, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    
+    // Update live settings
+    currentSettings.webhook = data.webhook;
+    currentSettings.threshold = parseFloat(data.threshold) || 1;
+    currentSettings.itemIds = data.itemIds ? data.itemIds.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id)) : [];
+    
+    console.log(`[CONFIG] Updated: Threshold=${currentSettings.threshold}%, Tracking=${currentSettings.itemIds.length > 0 ? currentSettings.itemIds.length + ' items' : 'ALL'}`);
   } catch (err) {
-    console.error('[CACHE] Failed to save:', err.message);
+    console.error(`[CONFIG] Failed to fetch settings: ${err.message}`);
   }
 }
 
 async function sendDiscordAlert(name, itemId, oldPrice, newPrice, dropPct) {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-  if (!webhookUrl) return false;
+  if (!currentSettings.webhook) return;
 
   const link = `https://www.torn.com/bazaar.php?itemId=${itemId}`;
   const payload = {
-    content: "@everyone",
     embeds: [{
-      author: { name: `🚨 Price Drop: ${name}` },
-      title: `${dropPct.toFixed(2)}% Drop Detected!`,
-      description: `**Old:** $${oldPrice.toLocaleString()}\n**New:** $${newPrice.toLocaleString()}\n\n[View Item on Bazaar](${link})`,
+      title: `📉 Price Drop: ${name}`,
+      url: link,
       color: 15158332,
+      fields: [
+        { name: 'Old Price', value: `$${oldPrice.toLocaleString()}`, inline: true },
+        { name: 'New Price', value: `$${newPrice.toLocaleString()}`, inline: true },
+        { name: 'Drop', value: `${dropPct.toFixed(2)}%`, inline: true }
+      ],
+      footer: { text: `Item ID: ${itemId}` }
+    }]
+  };
+
+  try {
+    const res = await fetch(currentSettings.webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (res.ok || res.status === 204) console.log(`[ALERT] ✅ Sent: ${name}`);
+    else console.error(`[ALERT] ❌ Discord Error: ${res.status}`);
+  } catch (err) { console.error(`[ALERT] ❌ Send failed: ${err.message}`); }
+}
+
+async function sendErrorWebhook(errorTitle, errorMessage) {
+  if (!currentSettings.webhook) return;
+  
+  const payload = {
+    embeds: [{
+      title: `⚠️ ERROR: ${errorTitle}`,
+      description: errorMessage,
+      color: 16711680,
       timestamp: new Date().toISOString()
     }]
   };
 
   try {
-    const res = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    await fetch(currentSettings.webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (res.ok || res.status === 204) {
-      console.log(`[ALERT] ✅ Sent: ${name} (${dropPct.toFixed(2)}%)`);
-      return true;
-    }
-    console.error(`[ALERT] ❌ Discord ${res.status}: ${await res.text()}`);
-  } catch (err) {
-    console.error(`[ALERT] ❌ Send failed: ${err.message}`);
-  }
-  return false;
+  } catch (err) { console.error('[ERROR WEBHOOK] Failed to send error report'); }
 }
 
-async function checkAllPrices() {
+// --- MAIN LOGIC ---
+
+async function checkPrices() {
+  // 1. Always fetch latest settings first
+  await fetchSettings();
+
+  if (!currentSettings.webhook) {
+    console.log('[CHECK] Skipped: No webhook configured in remote settings');
+    return;
+  }
+
+  console.log(`[CHECK] Starting marketplace scan...`);
   const startTime = Date.now();
-  console.log(`[CHECK] Fetching full marketplace...`);
 
   try {
-    const apiKeyParam = process.env.WEAV3R_API_KEY ? `?apiKey=${process.env.WEAV3R_API_KEY}` : "";
-    const res = await fetch(`${MARKETPLACE_URL}${apiKeyParam}`, {
-      headers: { "User-Agent": USER_AGENT }
+    const res = await fetch(MARKETPLACE_URL, {
+      headers: { 'User-Agent': USER_AGENT }
     });
+
+    // Handle 500 Errors specifically
+    if (res.status >= 500) {
+      let errorBody = { error: 'Server Error', message: 'No details' };
+      try { errorBody = await res.json(); } catch (e) {}
+      await sendErrorWebhook(errorBody.error || 'API Server Error', errorBody.message || 'Unknown error from Weav3r');
+      return;
+    }
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const rawData = await res.json();
-    const parseTime = Date.now();
+    const items = Array.isArray(rawData) ? rawData : (rawData.items || []);
     
-    // Handle both array and object-wrapped responses
-    const items = Array.isArray(rawData) ? rawData : (rawData.items || rawData.data || []);
-    
-    if (!items.length) throw new Error("No items found in API response");
-
     let dropsFound = 0;
-    let itemsTracked = 0;
+    const newCache = {};
 
     for (const item of items) {
       const id = item.item_id;
       
-      // Filter: Skip if we're tracking specific IDs and this isn't one of them
-      if (TRACKED_ITEM_IDS.length > 0 && !TRACKED_ITEM_IDS.includes(id)) continue;
+      // Filter Logic
+      if (currentSettings.itemIds.length > 0 && !currentSettings.itemIds.includes(id)) continue;
       
-      // Skip items with no active bazaars or null prices
-      const currentLowest = item.lowest_price;
-      if (currentLowest === null || currentLowest === undefined || item.total_bazaars === 0) continue;
+      // Skip invalid data
+      if (item.lowest_price === null || item.total_bazaars === 0) continue;
 
-      itemsTracked++;
-      const itemName = item.item_name || `Item ${id}`;
-      const prev = cachedMarketData[id];
-
-      // Update cache
-      cachedMarketData[id] = {
-        name: itemName,
-        lowestPrice: currentLowest,
-        timestamp: Date.now()
-      };
+      newCache[id] = item.lowest_price;
+      const prevPrice = cachedMarketData[id];
 
       // Check for drop
-      if (prev && prev.lowestPrice > 0 && currentLowest < prev.lowestPrice) {
-        const dropPct = (prev.lowestPrice - currentLowest) / prev.lowestPrice;
-
-        if (dropPct >= PRICE_DROP_THRESHOLD) {
+      if (prevPrice && prevPrice > 0 && item.lowest_price < prevPrice) {
+        const dropPct = ((prevPrice - item.lowest_price) / prevPrice) * 100;
+        
+        if (dropPct >= currentSettings.threshold) {
           dropsFound++;
-          console.log(`[DROP] 📉 ${itemName}: ${(dropPct * 100).toFixed(2)}% ($${prev.lowestPrice.toLocaleString()} → $${currentLowest.toLocaleString()})`);
-          
-          // Send immediately - don't wait
-          await sendDiscordAlert(itemName, id, prev.lowestPrice, currentLowest, dropPct * 100);
+          console.log(`[DROP] 📉 ${item.item_name}: ${(dropPct).toFixed(2)}% ($${prevPrice} → $${item.lowest_price})`);
+          await sendDiscordAlert(item.item_name, id, prevPrice, item.lowest_price, dropPct);
         }
       }
     }
 
+    // Update cache with only tracked items to keep file small
+    cachedMarketData = { ...cachedMarketData, ...newCache };
     saveCache();
+
     const totalTime = Date.now() - startTime;
-    console.log(`[CHECK] ✓ Done in ${totalTime}ms | Tracked: ${itemsTracked} | Drops: ${dropsFound} | Parse: ${parseTime - startTime}ms\n`);
+    console.log(`[CHECK] ✓ Done in ${totalTime}ms | Drops: ${dropsFound}\n`);
 
   } catch (err) {
-    console.error(`[CHECK] ❌ Failed: ${err.message}\n`);
+    console.error(`[CHECK] ❌ Critical Failure: ${err.message}`);
+    await sendErrorWebhook('Monitor Crash', err.message);
   }
 }
 
-function gracefulShutdown(signal) {
-  console.log(`[SHUTDOWN] ${signal} received. Saving cache...`);
-  saveCache();
-  process.exit(0);
-}
+// --- INITIALIZATION ---
 
 async function main() {
-  if (!process.env.DISCORD_WEBHOOK_URL) {
-    console.error('❌ DISCORD_WEBHOOK_URL not set in .env');
-    process.exit(1);
-  }
-
-  console.log('✅ Environment loaded');
-  console.log(`   Mode: ${TRACKED_ITEM_IDS.length > 0 ? `Tracking ${TRACKED_ITEM_IDS.length} items` : 'Tracking ALL items'}`);
-  console.log(`   Threshold: ${PRICE_DROP_THRESHOLD * 100}%\n`);
-
+  console.log('[INIT] Starting Torn Marketplace Monitor...');
   loadCache();
-
-  // Run immediately on start
-  await checkAllPrices();
+  
+  // Run immediately
+  await checkPrices();
 
   // Schedule every minute
-  cron.schedule('* * * * *', checkAllPrices);
+  cron.schedule('* * * * *', checkPrices);
 
-  console.log('✅ Monitoring active\n');
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  console.log('[INIT] Active. Waiting for next cycle...\n');
 }
 
-main().catch(err => {
-  console.error('[FATAL]', err);
-  process.exit(1);
-});
+main();
