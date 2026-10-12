@@ -1,28 +1,13 @@
 const MARKETPLACE_IDS = [1501];
 const PRICE_DROP_THRESHOLD = 0.01;
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const DATA_DIR = './data';
-const ALERTS_DIR = `${DATA_DIR}/alerts`;
-const STATE_FILE = `${DATA_DIR}/cycle_state.json`;
-const CACHE_FILE = `${DATA_DIR}/cache.json`;
+const CACHE_FILE = './price_cache.json';
 
 let cachedMarketData = {};
-let lastFetchTime = 0;
-let isFetching = false;
-
 const fs = require('fs');
-const path = require('path');
 const cron = require('node-cron');
 
-function ensureDirectories() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(ALERTS_DIR)) {
-    fs.mkdirSync(ALERTS_DIR, { recursive: true });
-  }
-}
-
+// Load cache
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
@@ -32,10 +17,10 @@ function loadCache() {
     }
   } catch (err) {
     console.error('[CACHE] Failed to load:', err.message);
-    cachedMarketData = {};
   }
 }
 
+// Save cache
 function saveCache() {
   try {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedMarketData, null, 2));
@@ -44,311 +29,169 @@ function saveCache() {
   }
 }
 
-function getCycleState() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const data = fs.readFileSync(STATE_FILE, 'utf8');
-      return JSON.parse(data);
-    }
-  } catch (err) {
-    console.error('[STATE] Failed to read:', err.message);
-  }
-  return { state: 'idle', timestamp: null };
-}
-
-function setCycleState(state) {
-  try {
-    const stateData = {
-      state: state,
-      timestamp: new Date().toISOString(),
-      expiresAt: Date.now() + 86400000
-    };
-    fs.writeFileSync(STATE_FILE, JSON.stringify(stateData, null, 2));
-  } catch (err) {
-    console.error('[STATE] Failed to write:', err.message);
-  }
-}
-
-function isStateExpired() {
-  const stateData = getCycleState();
-  if (!stateData.expiresAt) return true;
-  return Date.now() > stateData.expiresAt;
-}
-
-function listAlerts() {
-  try {
-    if (!fs.existsSync(ALERTS_DIR)) return [];
-    
-    const files = fs.readdirSync(ALERTS_DIR)
-      .filter(file => file.startsWith('alert_') && file.endsWith('.json'))
-      .map(file => ({
-        name: file.replace('.json', ''),
-        path: path.join(ALERTS_DIR, file),
-        mtime: fs.statSync(path.join(ALERTS_DIR, file)).mtimeMs
-      }))
-      .sort((a, b) => a.mtime - b.mtime);
-    
-    return files;
-  } catch (err) {
-    console.error('[QUEUE] Failed to list alerts:', err.message);
-    return [];
-  }
-}
-
-function readAlert(key) {
-  try {
-    const filePath = path.join(ALERTS_DIR, `${key}.json`);
-    if (!fs.existsSync(filePath)) return null;
-    
-    const data = fs.readFileSync(filePath, 'utf8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error(`[QUEUE] Failed to read alert ${key}:`, err.message);
-    return null;
-  }
-}
-
-function writeAlert(key, data) {
-  try {
-    const filePath = path.join(ALERTS_DIR, `${key}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error(`[QUEUE] Failed to write alert ${key}:`, err.message);
-  }
-}
-
-function deleteAlert(key) {
-  try {
-    const filePath = path.join(ALERTS_DIR, `${key}.json`);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  } catch (err) {
-    console.error(`[QUEUE] Failed to delete alert ${key}:`, err.message);
-  }
-}
-
-async function runCycle() {
-  if (isFetching) {
-    console.log("[CYCLE] Skipped: Already running");
-    return;
+// Send Discord alert immediately
+async function sendDiscordAlert(name, oldPrice, newPrice, dropPct, link) {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  
+  if (!webhookUrl) {
+    console.error('[ERROR] DISCORD_WEBHOOK_URL not set in environment');
+    return false;
   }
 
-  isFetching = true;
-  const startTime = Date.now();
+  const payload = {
+    content: "@everyone",
+    embeds: [{
+      author: { name: `🚨 Price Drop Alert: ${name}` },
+      title: `Price dropped by ${dropPct.toFixed(2)}%`,
+      description: `Old: $${oldPrice.toFixed(2)} → New: $${newPrice.toFixed(2)}\n\n[View on Bazaar](${link})`,
+      color: 15158332,
+      timestamp: new Date().toISOString()
+    }]
+  };
 
   try {
-    const stateData = getCycleState();
-    const state = stateData.state;
+    const res = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
 
-    if (state === "queued" && !isStateExpired()) {
-      console.log("[STATE] Queued detected → processing alert");
-      await processOneAlert();
-      
-      const currentState = getCycleState();
-      if (currentState.state !== "queued") {
-        setCycleState("idle");
-        console.log("[STATE] Reset to idle after successful alert processing");
-      } else {
-        console.log("[STATE] Remaining queued due to processing failure - will retry next minute");
-      }
+    if (res.ok || res.status === 204) {
+      console.log(`[ALERT] ✅ Sent Discord notification for ${name}`);
+      return true;
     } else {
-      console.log("[STATE] Idle detected → checking prices");
-      await checkPrices();
+      const errText = await res.text();
+      console.error(`[ALERT] ❌ Discord failed: ${res.status} - ${errText}`);
+      return false;
     }
-
-    lastFetchTime = Date.now();
-    console.log(`[CYCLE] Complete in ${Date.now() - startTime}ms`);
   } catch (err) {
-    console.error("[CYCLE] Error:", err.message);
-  } finally {
-    isFetching = false;
+    console.error(`[ALERT] ❌ Failed to send: ${err.message}`);
+    return false;
   }
 }
 
+// Check prices and send alerts immediately
 async function checkPrices() {
-  console.log(`[PRICE] Checking ${MARKETPLACE_IDS.length} IDs`);
-  let dropDetected = false;
+  console.log(`[CHECK] Monitoring ${MARKETPLACE_IDS.length} items...`);
 
   const apiKeyParam = process.env.WEAV3R_API_KEY ? `&apiKey=${process.env.WEAV3R_API_KEY}` : "";
 
-  const promises = MARKETPLACE_IDS.map(async (id) => {
+  for (const id of MARKETPLACE_IDS) {
     try {
       const res = await fetch(`https://weav3r.dev/api/marketplace/${id}?filler=1${apiKeyParam}`, {
         headers: { "User-Agent": USER_AGENT }
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      
+      if (!res.ok) {
+        console.error(`[ERROR] HTTP ${res.status} for item ${id}`);
+        continue;
+      }
 
       const data = await res.json();
-      let currentLowest = null;
       const itemName = data.item_name || `Item ${id}`;
-
+      
+      let currentLowest = null;
       if (data.listings?.length > 0) {
         currentLowest = Math.min(...data.listings.map(l => l.price));
       }
 
       const prev = cachedMarketData[id];
+      
+      // Update cache with current price
       cachedMarketData[id] = { 
         name: itemName, 
         lowestPrice: currentLowest, 
         timestamp: new Date().toISOString() 
       };
 
+      // Check for price drop
       if (currentLowest !== null && prev?.lowestPrice > 0) {
         const dropPct = (prev.lowestPrice - currentLowest) / prev.lowestPrice;
 
         if (dropPct >= PRICE_DROP_THRESHOLD) {
-          console.log(`[ALERT] Drop detected: ID ${id} (${(dropPct * 100).toFixed(2)}%)`);
+          console.log(`[DROP] 📉 ${itemName}: ${(dropPct * 100).toFixed(2)}% drop ($${prev.lowestPrice} → $${currentLowest})`);
+          
+          // Get detailed info for the link
+          let link = `https://www.torn.com/bazaar.php?itemId=${id}`;
+          
+          try {
+            const detailRes = await fetch(`https://weav3r.dev/api/marketplace/${id}${apiKeyParam ? `?apiKey=${process.env.WEAV3R_API_KEY}` : ''}`, {
+              headers: { "User-Agent": USER_AGENT }
+            });
+            
+            if (detailRes.ok) {
+              const detailData = await detailRes.json();
+              if (detailData.listings?.length > 0) {
+                const sorted = [...detailData.listings].sort((a, b) => a.price - b.price);
+                const cheapestPlayerId = sorted[0].player_id;
+                if (cheapestPlayerId) {
+                  link = `https://www.torn.com/bazaar.php?userId=${cheapestPlayerId}#/`;
+                }
+              }
+            }
+          } catch (err) {
+            console.error(`[WARN] Could not fetch details for link: ${err.message}`);
+          }
 
-          const alertKey = `alert_${id}_${Date.now()}`;
-          const alertData = {
-            id,
-            name: itemName,
-            oldPrice: prev.lowestPrice,
-            newPrice: currentLowest,
-            dropPercent: parseFloat((dropPct * 100).toFixed(2)),
-            timestamp: new Date().toISOString()
-          };
-
-          writeAlert(alertKey, alertData);
-          dropDetected = true;
+          // Send alert IMMEDIATELY
+          await sendDiscordAlert(itemName, prev.lowestPrice, currentLowest, dropPct * 100, link);
         }
       }
+      
     } catch (err) {
-      console.error(`[ERROR] ID ${id}:`, err.message);
+      console.error(`[ERROR] Failed to check item ${id}: ${err.message}`);
     }
-  });
+  }
 
-  await Promise.allSettled(promises);
+  // Save updated cache
   saveCache();
-
-  if (dropDetected) {
-    setCycleState("queued");
-    console.log("[STATE] Set to queued for next cycle");
-  }
+  console.log('[CHECK] ✓ Complete\n');
 }
 
-async function processOneAlert() {
-  console.log("[QUEUE] Fetching oldest pending alert...");
-
-  const alerts = listAlerts();
-  if (alerts.length === 0) {
-    console.log("[QUEUE] No alerts found despite queued state - resetting");
-    setCycleState("idle");
-    return;
-  }
-
-  console.log(`[QUEUE] Found ${alerts.length} pending, processing first`);
-
-  const alertFile = alerts[0];
-  const key = alertFile.name;
-  const alert = readAlert(key);
-
-  if (!alert) {
-    console.log("[QUEUE] Stale key, deleting");
-    deleteAlert(key);
-    return;
-  }
-
-  console.log(`[QUEUE] Processing: ID ${alert.id} | ${alert.name} | ${alert.dropPercent}% drop`);
-
-  try {
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    const apiKeyParam = process.env.WEAV3R_API_KEY ? `?apiKey=${process.env.WEAV3R_API_KEY}` : "";
-    const detailUrl = `https://weav3r.dev/api/marketplace/${alert.id}${apiKeyParam}`;
-    console.log(`[DETAIL] GET ${detailUrl}`);
-
-    const res = await fetch(detailUrl, {
-      headers: { "User-Agent": USER_AGENT, "Accept": "application/json" }
-    });
-
-    const rawBody = await res.text();
-    console.log(`[DETAIL-RESPONSE] Status: ${res.status} | URL: ${detailUrl}`);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${rawBody.substring(0, 200)}`);
-
-    const data = JSON.parse(rawBody);
-    let cheapestPlayerId = null;
-    let actualLowest = alert.newPrice;
-
-    if (data.listings?.length > 0) {
-      const sorted = [...data.listings].sort((a, b) => a.price - b.price);
-      cheapestPlayerId = sorted[0].player_id;
-      actualLowest = sorted[0].price;
-      console.log(`[LINK] Cheapest: Player ${cheapestPlayerId} @ ${actualLowest}`);
-    }
-
-    const link = cheapestPlayerId
-      ? `https://www.torn.com/bazaar.php?userId=${cheapestPlayerId}#/`
-      : `https://www.torn.com/bazaar.php?itemId=${alert.id}`;
-
-    await sendDiscordAlert(alert.name, alert.oldPrice, actualLowest, alert.dropPercent, link);
-
-    deleteAlert(key);
-    console.log(`[QUEUE] ✅ Sent and removed for ID ${alert.id}`);
-
-    setCycleState("idle");
-
-  } catch (err) {
-    console.error(`[QUEUE] ❌ Failed for ID ${alert.id}: ${err.message}`);
-    console.log("[QUEUE] Alert preserved for retry - state remains queued");
-  }
-}
-
-async function sendDiscordAlert(name, oldPrice, newPrice, dropPct, link) {
-  if (!process.env.DISCORD_WEBHOOK_URL) {
-    throw new Error('DISCORD_WEBHOOK_URL not configured');
-  }
-
-  const payload = {
-    content: "@everyone",
-    embeds: [{
-      author: { name: `New Alert for ${name}` },
-      title: `Price of ${name} has dropped by ${dropPct.toFixed(2)}%`,
-      color: 3349162,
-      description: `Click the link below to go to the bazaar\n${link}`
-    }],
-    attachments: []
-  };
-
-  console.log("[WEBHOOK] Sending payload");
-
-  const res = await fetch(process.env.DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  if (res.ok || res.status === 204) {
-    console.log("[WEBHOOK] ✅ Success");
-  } else {
-    const errText = await res.text();
-    throw new Error(`Discord ${res.status}: ${errText}`);
-  }
-}
-
+// Graceful shutdown
 function gracefulShutdown(signal) {
-  console.log(`[SHUTDOWN] Received ${signal}. Cleaning up...`);
+  console.log(`[SHUTDOWN] Received ${signal}`);
+  saveCache();
   process.exit(0);
 }
 
+// Initialize
 async function main() {
-  ensureDirectories();
+  // Check for required env vars
+  if (!process.env.DISCORD_WEBHOOK_URL) {
+    console.error('❌ ERROR: DISCORD_WEBHOOK_URL is not set!');
+    console.error('Create a .env file with: DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN');
+    process.exit(1);
+  }
+
+  console.log('✅ Environment variables loaded');
+  console.log(`   Webhook: ${process.env.DISCORD_WEBHOOK_URL.substring(0, 30)}...`);
+  if (process.env.WEAV3R_API_KEY) {
+    console.log(`   API Key: Configured`);
+  } else {
+    console.log(`   API Key: Not set (using public rate limits)`);
+  }
+  console.log('');
+
   loadCache();
   
+  // Run immediately on start
+  console.log('[INIT] Running initial check...\n');
+  await checkPrices();
+  
+  // Schedule every minute
   cron.schedule('* * * * *', async () => {
-    console.log(`[CRON] Fired at ${new Date().toISOString()}`);
-    await runCycle();
+    await checkPrices();
   });
   
-  console.log('[INIT] Application started - monitoring every minute');
+  console.log('✅ Monitoring active - checking every minute');
+  console.log('   Press Ctrl+C to stop\n');
   
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 main().catch(err => {
-  console.error('[FATAL] Failed to start:', err);
+  console.error('[FATAL]', err);
   process.exit(1);
 });
