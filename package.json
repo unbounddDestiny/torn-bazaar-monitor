@@ -1,0 +1,15 @@
+{
+  "name": "torn-bazaar-monitor",
+  "version": "1.0.0",
+  "description": "Monitors Torn marketplace prices and sends Discord alerts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
