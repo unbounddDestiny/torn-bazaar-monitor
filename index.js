@@ -1,49 +1,48 @@
-const MARKETPLACE_IDS = [1501];
-const PRICE_DROP_THRESHOLD = 0.01;
+require('dotenv').config();
+
+const MARKETPLACE_URL = 'https://weav3r.dev/api/marketplace';
+const PRICE_DROP_THRESHOLD = 0.01; // 1% drop triggers alert
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const CACHE_FILE = './price_cache.json';
+
+// Optional: Only track specific IDs. Leave empty [] to track EVERYTHING
+const TRACKED_ITEM_IDS = []; 
 
 let cachedMarketData = {};
 const fs = require('fs');
 const cron = require('node-cron');
 
-// Load cache
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
       const data = fs.readFileSync(CACHE_FILE, 'utf8');
       cachedMarketData = JSON.parse(data);
-      console.log('[CACHE] Loaded from file');
+      console.log(`[CACHE] Loaded ${Object.keys(cachedMarketData).length} items from file`);
     }
   } catch (err) {
     console.error('[CACHE] Failed to load:', err.message);
   }
 }
 
-// Save cache
 function saveCache() {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedMarketData, null, 2));
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedMarketData, null, 0)); // Compact JSON for speed
   } catch (err) {
     console.error('[CACHE] Failed to save:', err.message);
   }
 }
 
-// Send Discord alert immediately
-async function sendDiscordAlert(name, oldPrice, newPrice, dropPct, link) {
+async function sendDiscordAlert(name, itemId, oldPrice, newPrice, dropPct) {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-  
-  if (!webhookUrl) {
-    console.error('[ERROR] DISCORD_WEBHOOK_URL not set in environment');
-    return false;
-  }
+  if (!webhookUrl) return false;
 
+  const link = `https://www.torn.com/bazaar.php?itemId=${itemId}`;
   const payload = {
     content: "@everyone",
     embeds: [{
-      author: { name: `🚨 Price Drop Alert: ${name}` },
-      title: `Price dropped by ${dropPct.toFixed(2)}%`,
-      description: `Old: $${oldPrice.toFixed(2)} → New: $${newPrice.toFixed(2)}\n\n[View on Bazaar](${link})`,
+      author: { name: `🚨 Price Drop: ${name}` },
+      title: `${dropPct.toFixed(2)}% Drop Detected!`,
+      description: `**Old:** $${oldPrice.toLocaleString()}\n**New:** $${newPrice.toLocaleString()}\n\n[View Item on Bazaar](${link})`,
       color: 15158332,
       timestamp: new Date().toISOString()
     }]
@@ -55,138 +54,109 @@ async function sendDiscordAlert(name, oldPrice, newPrice, dropPct, link) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-
     if (res.ok || res.status === 204) {
-      console.log(`[ALERT] ✅ Sent Discord notification for ${name}`);
+      console.log(`[ALERT] ✅ Sent: ${name} (${dropPct.toFixed(2)}%)`);
       return true;
-    } else {
-      const errText = await res.text();
-      console.error(`[ALERT] ❌ Discord failed: ${res.status} - ${errText}`);
-      return false;
     }
+    console.error(`[ALERT] ❌ Discord ${res.status}: ${await res.text()}`);
   } catch (err) {
-    console.error(`[ALERT] ❌ Failed to send: ${err.message}`);
-    return false;
+    console.error(`[ALERT] ❌ Send failed: ${err.message}`);
   }
+  return false;
 }
 
-// Check prices and send alerts immediately
-async function checkPrices() {
-  console.log(`[CHECK] Monitoring ${MARKETPLACE_IDS.length} items...`);
+async function checkAllPrices() {
+  const startTime = Date.now();
+  console.log(`[CHECK] Fetching full marketplace...`);
 
-  const apiKeyParam = process.env.WEAV3R_API_KEY ? `&apiKey=${process.env.WEAV3R_API_KEY}` : "";
+  try {
+    const apiKeyParam = process.env.WEAV3R_API_KEY ? `?apiKey=${process.env.WEAV3R_API_KEY}` : "";
+    const res = await fetch(`${MARKETPLACE_URL}${apiKeyParam}`, {
+      headers: { "User-Agent": USER_AGENT }
+    });
 
-  for (const id of MARKETPLACE_IDS) {
-    try {
-      const res = await fetch(`https://weav3r.dev/api/marketplace/${id}?filler=1${apiKeyParam}`, {
-        headers: { "User-Agent": USER_AGENT }
-      });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const rawData = await res.json();
+    const parseTime = Date.now();
+    
+    // Handle both array and object-wrapped responses
+    const items = Array.isArray(rawData) ? rawData : (rawData.items || rawData.data || []);
+    
+    if (!items.length) throw new Error("No items found in API response");
+
+    let dropsFound = 0;
+    let itemsTracked = 0;
+
+    for (const item of items) {
+      const id = item.item_id;
       
-      if (!res.ok) {
-        console.error(`[ERROR] HTTP ${res.status} for item ${id}`);
-        continue;
-      }
-
-      const data = await res.json();
-      const itemName = data.item_name || `Item ${id}`;
+      // Filter: Skip if we're tracking specific IDs and this isn't one of them
+      if (TRACKED_ITEM_IDS.length > 0 && !TRACKED_ITEM_IDS.includes(id)) continue;
       
-      let currentLowest = null;
-      if (data.listings?.length > 0) {
-        currentLowest = Math.min(...data.listings.map(l => l.price));
-      }
+      // Skip items with no active bazaars or null prices
+      const currentLowest = item.lowest_price;
+      if (currentLowest === null || currentLowest === undefined || item.total_bazaars === 0) continue;
 
+      itemsTracked++;
+      const itemName = item.item_name || `Item ${id}`;
       const prev = cachedMarketData[id];
-      
-      // Update cache with current price
-      cachedMarketData[id] = { 
-        name: itemName, 
-        lowestPrice: currentLowest, 
-        timestamp: new Date().toISOString() 
+
+      // Update cache
+      cachedMarketData[id] = {
+        name: itemName,
+        lowestPrice: currentLowest,
+        timestamp: Date.now()
       };
 
-      // Check for price drop
-      if (currentLowest !== null && prev?.lowestPrice > 0) {
+      // Check for drop
+      if (prev && prev.lowestPrice > 0 && currentLowest < prev.lowestPrice) {
         const dropPct = (prev.lowestPrice - currentLowest) / prev.lowestPrice;
 
         if (dropPct >= PRICE_DROP_THRESHOLD) {
-          console.log(`[DROP] 📉 ${itemName}: ${(dropPct * 100).toFixed(2)}% drop ($${prev.lowestPrice} → $${currentLowest})`);
+          dropsFound++;
+          console.log(`[DROP] 📉 ${itemName}: ${(dropPct * 100).toFixed(2)}% ($${prev.lowestPrice.toLocaleString()} → $${currentLowest.toLocaleString()})`);
           
-          // Get detailed info for the link
-          let link = `https://www.torn.com/bazaar.php?itemId=${id}`;
-          
-          try {
-            const detailRes = await fetch(`https://weav3r.dev/api/marketplace/${id}${apiKeyParam ? `?apiKey=${process.env.WEAV3R_API_KEY}` : ''}`, {
-              headers: { "User-Agent": USER_AGENT }
-            });
-            
-            if (detailRes.ok) {
-              const detailData = await detailRes.json();
-              if (detailData.listings?.length > 0) {
-                const sorted = [...detailData.listings].sort((a, b) => a.price - b.price);
-                const cheapestPlayerId = sorted[0].player_id;
-                if (cheapestPlayerId) {
-                  link = `https://www.torn.com/bazaar.php?userId=${cheapestPlayerId}#/`;
-                }
-              }
-            }
-          } catch (err) {
-            console.error(`[WARN] Could not fetch details for link: ${err.message}`);
-          }
-
-          // Send alert IMMEDIATELY
-          await sendDiscordAlert(itemName, prev.lowestPrice, currentLowest, dropPct * 100, link);
+          // Send immediately - don't wait
+          await sendDiscordAlert(itemName, id, prev.lowestPrice, currentLowest, dropPct * 100);
         }
       }
-      
-    } catch (err) {
-      console.error(`[ERROR] Failed to check item ${id}: ${err.message}`);
     }
-  }
 
-  // Save updated cache
-  saveCache();
-  console.log('[CHECK] ✓ Complete\n');
+    saveCache();
+    const totalTime = Date.now() - startTime;
+    console.log(`[CHECK] ✓ Done in ${totalTime}ms | Tracked: ${itemsTracked} | Drops: ${dropsFound} | Parse: ${parseTime - startTime}ms\n`);
+
+  } catch (err) {
+    console.error(`[CHECK] ❌ Failed: ${err.message}\n`);
+  }
 }
 
-// Graceful shutdown
 function gracefulShutdown(signal) {
-  console.log(`[SHUTDOWN] Received ${signal}`);
+  console.log(`[SHUTDOWN] ${signal} received. Saving cache...`);
   saveCache();
   process.exit(0);
 }
 
-// Initialize
 async function main() {
-  // Check for required env vars
   if (!process.env.DISCORD_WEBHOOK_URL) {
-    console.error('❌ ERROR: DISCORD_WEBHOOK_URL is not set!');
-    console.error('Create a .env file with: DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN');
+    console.error('❌ DISCORD_WEBHOOK_URL not set in .env');
     process.exit(1);
   }
 
-  console.log('✅ Environment variables loaded');
-  console.log(`   Webhook: ${process.env.DISCORD_WEBHOOK_URL.substring(0, 30)}...`);
-  if (process.env.WEAV3R_API_KEY) {
-    console.log(`   API Key: Configured`);
-  } else {
-    console.log(`   API Key: Not set (using public rate limits)`);
-  }
-  console.log('');
+  console.log('✅ Environment loaded');
+  console.log(`   Mode: ${TRACKED_ITEM_IDS.length > 0 ? `Tracking ${TRACKED_ITEM_IDS.length} items` : 'Tracking ALL items'}`);
+  console.log(`   Threshold: ${PRICE_DROP_THRESHOLD * 100}%\n`);
 
   loadCache();
-  
+
   // Run immediately on start
-  console.log('[INIT] Running initial check...\n');
-  await checkPrices();
-  
+  await checkAllPrices();
+
   // Schedule every minute
-  cron.schedule('* * * * *', async () => {
-    await checkPrices();
-  });
-  
-  console.log('✅ Monitoring active - checking every minute');
-  console.log('   Press Ctrl+C to stop\n');
-  
+  cron.schedule('* * * * *', checkAllPrices);
+
+  console.log('✅ Monitoring active\n');
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
