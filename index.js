@@ -5,7 +5,7 @@ const cron = require('node-cron');
 
 // --- CONFIGURATION ---
 // REPLACE THIS WITH YOUR CLOUDFLARE WORKER URL
-const SETTINGS_URL = 'https://your-worker-name.your-subdomain.workers.dev/api/settings';
+const SETTINGS_URL = 'https://dashboard.linzihan663.workers.dev/api/settings';
 
 const MARKETPLACE_URL = 'https://weav3r.dev/api/marketplace';
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
